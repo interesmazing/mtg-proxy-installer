@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+#
+# MTG Proxy 一键安装脚本
+# 项目地址: https://github.com/interesmazing/mtg-proxy-installer
+# MTG 项目: https://github.com/9seconds/mtg
+# 适用系统: Ubuntu 24.04 LTS x64
+#
+
+set -e
+
+# ============================================
+# 配置常量
+# ============================================
+
+readonly BINEXEC="/usr/local/bin/mtg"
+readonly CONFIG_FILE="/etc/mtg.toml"
+readonly SERVICE_FILE="/etc/systemd/system/mtg.service"
+readonly MTG_REPO="9seconds/mtg"
+
+# 默认配置
+readonly DEFAULT_PORT="8440"
+readonly DEFAULT_DOMAIN="azure.microsoft.com"
+readonly DEFAULT_TAG=""
+
+# 性能配置
+readonly BIND_TO="0.0.0.0"
+readonly CONCURRENCY="2048"
+readonly TCP_BUFFER="256kb"
+readonly DOH_IP="1.1.1.1"
+readonly BLOCKLIST_URL="https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt"
+readonly BLOCKLIST_UPDATE="12h"
+readonly TIMEOUT_TCP="3s"
+readonly TIMEOUT_HTTP="5s"
+readonly TIMEOUT_IDLE="30s"
+
+# ============================================
+# 颜色输出函数
+# ============================================
+
+red() {
+    echo -e "\033[31m$*\033[0m"
+}
+
+green() {
+    echo -e "\033[32m$*\033[0m"
+}
+
+yellow() {
+    echo -e "\033[33m$*\033[0m"
+}
+
+blue() {
+    echo -e "\033[34m$*\033[0m"
+}
+
+cyan() {
+    echo -e "\033[36m$*\033[0m"
+}
+
+# ============================================
+# 错误处理
+# ============================================
+
+error_exit() {
+    red "错误: $1"
+    exit 1
+}
+
+# ============================================
+# 系统检查
+# ============================================
+
+check_system() {
+    # 检查是否为 root
+    if [[ $EUID -ne 0 ]]; then
+        error_exit "此脚本需要 root 权限运行，请使用 sudo"
+    fi
+
+    # 检查是否为 systemd 系统
+    if [[ ! -d /run/systemd/system ]]; then
+        error_exit "此脚本仅支持使用 systemd 的 Linux 发行版"
+    fi
+
+    # 检查必要命令
+    local required_cmds="wget tar systemctl"
+    for cmd in $required_cmds; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            error_exit "缺少必要的命令: $cmd，请先安装"
+        fi
+    done
+
+    green "✓ 系统检查通过"
+}
+
+# ============================================
+# 获取系统架构
+# ============================================
+
+get_arch() {
+    local arch
+    arch=$(uname -m)
+    
+    case $arch in
+        x86_64)
+            echo "linux-amd64"
+            ;;
+        aarch64)
+            echo "linux-arm64"
+            ;;
+        armv7l)
+            echo "linux-arm"
+            ;;
+        i*86)
+            echo "linux-386"
+            ;;
+        *)
+            error_exit "不支持的系统架构: $arch"
+            ;;
+    esac
+}
+
+# ============================================
+# 下载并安装 MTG
+# ============================================
+
+install_mtg() {
+    yellow "\n正在下载 MTG..."
+    
+    local arch
+    arch=$(get_arch)
+    
+    local download_url
+    download_url=$(wget -qO- "https://api.github.com/repos/${MTG_REPO}/releases/latest" \
+        | grep "browser_download_url.*${arch}" \
+        | cut -d '"' -f 4)
+    
+    if [[ -z $download_url ]]; then
+        error_exit "无法获取下载链接"
+    fi
+    
+    local temp_file
+    temp_file=$(mktemp --suffix=.tar.gz)
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    
+    # 清理函数
+    cleanup() {
+        rm -rf "$temp_file" "$temp_dir"
+    }
+    trap cleanup EXIT
+    
+    # 下载
+    if ! wget -q --show-progress "$download_url" -O "$temp_file"; then
+        error_exit "下载失败"
+    fi
+    
+    # 解压
+    yellow "正在解压..."
+    if ! tar xf "$temp_file" --strip-components=1 -C "$temp_dir"; then
+        error_exit "解压失败"
+    fi
+    
+    # 停止现有服务
+    if systemctl is-active --quiet mtg 2>/dev/null; then
+        yellow "停止现有服务..."
+        systemctl stop mtg
+    fi
+    
+    # 安装
+    yellow "正在安装..."
+    install -m 755 "$temp_dir/mtg" "$BINEXEC"
+    
+    green "✓ MTG 安装完成"
+    
+    # 显示版本
+    local version
+    version=$("$BINEXEC" --version 2>&1 | head -n1)
+    cyan "  版本: $version"
+}
+
+# ============================================
+# 用户输入
+# ============================================
+
+get_user_input() {
+    echo ""
+    cyan "========================================"
+    cyan "  请输入配置信息（直接回车使用默认值）"
+    cyan "========================================"
+    echo ""
+    
+    # 端口
+    read -p "$(yellow '请输入服务端口 [默认: ')$(green "$DEFAULT_PORT")$(yellow ']: ')" input_port
+    PORT=${input_port:-$DEFAULT_PORT}
+    
+    # 验证端口
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        error_exit "无效的端口号: $PORT"
+    fi
+    
+    # 伪装域名
+    read -p "$(yellow '请输入伪装域名 [默认: ')$(green "$DEFAULT_DOMAIN")$(yellow ']: ')" input_domain
+    DOMAIN=${input_domain:-$DEFAULT_DOMAIN}
+    
+    # 密钥
+    read -p "$(yellow '请输入密钥 [默认: ')$(green '自动生成')$(yellow ']: ')" input_secret
+    if [[ -n $input_secret ]]; then
+        SECRET="$input_secret"
+    else
+        yellow "正在生成密钥..."
+        SECRET=$("$BINEXEC" generate-secret "$DOMAIN")
+        green "✓ 密钥已生成"
+    fi
+    
+    # Telegram 频道
+    read -p "$(yellow '请输入 Telegram 频道 [默认: ')$(green '无')$(yellow ']: ')" input_tag
+    TAG=${input_tag:-$DEFAULT_TAG}
+    
+    # 如果有频道，添加到密钥
+    if [[ -n $TAG ]]; then
+        # 移除 @ 符号
+        TAG=${TAG#@}
+        SECRET="${SECRET}${TAG}"
+    fi
+    
+    echo ""
+    cyan "========================================"
+    cyan "  配置信息确认"
+    cyan "========================================"
+    blue "  端口: $PORT"
+    blue "  伪装域名: $DOMAIN"
+    blue "  密钥: $SECRET"
+    if [[ -n $TAG ]]; then
+        blue "  频道: @$TAG"
+    fi
+    cyan "========================================"
+    echo ""
+}
+
+# ============================================
+# 生成配置文件
+# ============================================
+
+generate_config() {
+    yellow "正在生成配置文件..."
+    
+    cat > "$CONFIG_FILE" <<EOF
+# MTG Proxy 配置文件
+# 完整配置文档: https://github.com/9seconds/mtg/blob/master/example.config.toml
+
+secret = "$SECRET"
+bind-to = "$BIND_TO:$PORT"
+concurrency = $CONCURRENCY
+tcp-buffer = "$TCP_BUFFER"
+prefer-ip = "prefer-ipv4"
+domain-fronting-port = 443
+tolerate-time-skewness = "60s"
+
+[network]
+doh-ip = "$DOH_IP"
+
+[network.timeout]
+tcp = "$TIMEOUT_TCP"
+http = "$TIMEOUT_HTTP"
+idle = "$TIMEOUT_IDLE"
+
+[defense.anti-replay]
+enabled = true
+max-size = "1mib"
+error-rate = 0.001
+
+[defense.blocklist]
+enabled = true
+download-concurrency = 2
+urls = [
+    "$BLOCKLIST_URL"
+]
+update-each = "$BLOCKLIST_UPDATE"
+EOF
+
+    green "✓ 配置文件已生成: $CONFIG_FILE"
+}
+
+# ============================================
+# 生成 systemd 服务
+# ============================================
+
+generate_service() {
+    yellow "正在生成 systemd 服务..."
+    
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=MTG Proxy - Telegram MTProto Proxy
+Documentation=https://github.com/9seconds/mtg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+User=root
+Group=root
+
+ExecStart=$BINEXEC run $CONFIG_FILE
+
+# 资源限制
+LimitNOFILE=1048576
+LimitNPROC=512
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mtg
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    green "✓ systemd 服务已生成: $SERVICE_FILE"
+}
+
+# ============================================
+# 启动服务
+# ============================================
+
+start_service() {
+    yellow "正在启动服务..."
+    
+    systemctl daemon-reload
+    systemctl enable mtg
+    systemctl start mtg
+    
+    # 等待服务启动
+    sleep 2
+    
+    if systemctl is-active --quiet mtg; then
+        green "✓ 服务启动成功"
+    else
+        red "✗ 服务启动失败"
+        red "请查看日志: journalctl -u mtg -n 50"
+        exit 1
+    fi
+}
+
+# ============================================
+# 显示访问信息
+# ============================================
+
+show_info() {
+    clear
+    echo ""
+    green "========================================"
+    green "  MTG Proxy 安装成功！"
+    green "========================================"
+    echo ""
+    
+    # 显示服务状态
+    cyan "【服务状态】"
+    systemctl status mtg --no-pager -l | head -n 10
+    echo ""
+    
+    # 显示访问链接
+    cyan "【Telegram 代理链接】"
+    echo ""
+    "$BINEXEC" access "$CONFIG_FILE" 2>/dev/null || {
+        yellow "无法自动获取链接，请手动运行: mtg access $CONFIG_FILE"
+    }
+    echo ""
+    
+    # 显示管理命令
+    cyan "========================================"
+    cyan "  管理命令"
+    cyan "========================================"
+    blue "  查看状态: systemctl status mtg"
+    blue "  启动服务: systemctl start mtg"
+    blue "  停止服务: systemctl stop mtg"
+    blue "  重启服务: systemctl restart mtg"
+    blue "  查看日志: journalctl -u mtg -f"
+    blue "  查看链接: mtg access $CONFIG_FILE"
+    echo ""
+    cyan "========================================"
+    cyan "  卸载命令"
+    cyan "========================================"
+    blue "  systemctl stop mtg"
+    blue "  systemctl disable mtg"
+    blue "  rm -f $BINEXEC"
+    blue "  rm -f $SERVICE_FILE"
+    blue "  rm -f $CONFIG_FILE"
+    blue "  systemctl daemon-reload"
+    cyan "========================================"
+    echo ""
+    green "安装完成！请将上面的链接添加到 Telegram 客户端"
+    echo ""
+}
+
+# ============================================
+# 升级模式
+# ============================================
+
+upgrade_mode() {
+    yellow "\n检测到现有配置，进入升级模式..."
+    yellow "将保留现有配置，仅升级 MTG 二进制文件\n"
+    
+    read -p "$(yellow '是否继续升级？[Y/n]: ')" confirm
+    confirm=${confirm:-Y}
+    
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        yellow "已取消升级"
+        exit 0
+    fi
+    
+    install_mtg
+    
+    yellow "重启服务..."
+    systemctl restart mtg
+    
+    sleep 2
+    
+    if systemctl is-active --quiet mtg; then
+        green "\n✓ 升级成功！"
+        cyan "\n当前版本: $("$BINEXEC" --version 2>&1 | head -n1)"
+    else
+        red "\n✗ 服务启动失败，请检查日志"
+        exit 1
+    fi
+}
+
+# ============================================
+# 主函数
+# ============================================
+
+main() {
+    clear
+    echo ""
+    green "========================================"
+    green "  MTG Proxy 一键安装脚本"
+    green "========================================"
+    green "  MTG: https://github.com/9seconds/mtg"
+    green "  适用: Ubuntu 24.04 LTS x64"
+    green "========================================"
+    echo ""
+    
+    # 系统检查
+    check_system
+    
+    # 检查是否已安装
+    if [[ -f $CONFIG_FILE ]]; then
+        upgrade_mode
+        exit 0
+    fi
+    
+    # 全新安装
+    install_mtg
+    get_user_input
+    generate_config
+    generate_service
+    start_service
+    show_info
+}
+
+# ============================================
+# 脚本入口
+# ============================================
+
+main "$@"
