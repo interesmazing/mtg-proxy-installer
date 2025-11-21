@@ -82,10 +82,21 @@ check_system() {
     fi
 
     # 检查必要命令
-    local required_cmds="wget tar systemctl"
+    local required_cmds="wget tar systemctl xxd"
     for cmd in $required_cmds; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
-            error_exit "缺少必要的命令: $cmd，请先安装"
+            if [[ "$cmd" == "xxd" ]]; then
+                yellow "正在安装 xxd..."
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get update -qq && apt-get install -y xxd vim-common
+                elif command -v yum >/dev/null 2>&1; then
+                    yum install -y vim-common
+                else
+                    error_exit "无法安装 xxd，请手动安装后重试"
+                fi
+            else
+                error_exit "缺少必要的命令: $cmd，请先安装"
+            fi
         fi
     done
 
@@ -179,6 +190,52 @@ install_mtg() {
 }
 
 # ============================================
+# 生成随机密钥
+# ============================================
+
+generate_random_secret() {
+    head -c 16 /dev/urandom | xxd -ps
+}
+
+# ============================================
+# 将域名转换为十六进制
+# ============================================
+
+domain_to_hex() {
+    local domain=$1
+    echo -n "$domain" | xxd -ps
+}
+
+# ============================================
+# 构建完整的 MTG 密钥
+# ============================================
+
+build_mtg_secret() {
+    local raw_secret=$1
+    local domain=$2
+    local tag=$3
+    
+    # 验证原始密钥格式（应该是32个十六进制字符）
+    if [[ ! $raw_secret =~ ^[0-9a-fA-F]{32}$ ]]; then
+        error_exit "密钥格式错误，应该是32位十六进制字符串"
+    fi
+    
+    # 转换域名为十六进制
+    local domain_hex
+    domain_hex=$(domain_to_hex "$domain")
+    
+    # 构建完整密钥：ee + 原始密钥 + 域名十六进制
+    local full_secret="ee${raw_secret}${domain_hex}"
+    
+    # 如果有 TAG，添加到末尾
+    if [[ -n $tag ]]; then
+        full_secret="${full_secret}${tag}"
+    fi
+    
+    echo "$full_secret"
+}
+
+# ============================================
 # 用户输入
 # ============================================
 
@@ -203,25 +260,45 @@ get_user_input() {
     DOMAIN=${input_domain:-$DEFAULT_DOMAIN}
     
     # 密钥
+    echo ""
+    yellow "密钥设置："
+    yellow "  1. 直接回车 - 自动生成随机密钥"
+    yellow "  2. 输入32位十六进制字符串 - 使用自定义密钥"
+    echo ""
     read -p "$(yellow '请输入密钥 [默认: ')$(green '自动生成')$(yellow ']: ')" input_secret
+    
     if [[ -n $input_secret ]]; then
-        SECRET="$input_secret"
+        # 验证用户输入的密钥格式
+        if [[ ! $input_secret =~ ^[0-9a-fA-F]{32}$ ]]; then
+            error_exit "密钥格式错误！应该是32位十六进制字符串（例如：fac4d5d2c59f89779bccffcd5d2cb151）"
+        fi
+        RAW_SECRET="$input_secret"
     else
-        yellow "正在生成密钥..."
-        SECRET=$("$BINEXEC" generate-secret "$DOMAIN")
-        green "✓ 密钥已生成"
+        yellow "正在生成随机密钥..."
+        RAW_SECRET=$(generate_random_secret)
+        green "✓ 密钥已生成: $RAW_SECRET"
     fi
     
     # Telegram 频道
-    read -p "$(yellow '请输入 Telegram 频道 [默认: ')$(green '无')$(yellow ']: ')" input_tag
+    echo ""
+    read -p "$(yellow '请输入 Telegram 频道标签 [默认: ')$(green '无')$(yellow ']: ')" input_tag
     TAG=${input_tag:-$DEFAULT_TAG}
     
-    # 如果有频道，添加到密钥
-    if [[ -n $TAG ]]; then
-        # 移除 @ 符号
-        TAG=${TAG#@}
-        SECRET="${SECRET}${TAG}"
+    # 移除 @ 符号
+    TAG=${TAG#@}
+    
+    # 验证 TAG 格式（如果提供）
+    if [[ -n $TAG ]] && [[ ! $TAG =~ ^[A-Za-z0-9]{32}$ ]]; then
+        yellow "警告: TAG 格式可能不正确（应该是32位字母数字组合）"
+        read -p "$(yellow '是否继续？[Y/n]: ')" confirm
+        confirm=${confirm:-Y}
+        if [[ ! $confirm =~ ^[Yy]$ ]]; then
+            error_exit "已取消"
+        fi
     fi
+    
+    # 构建完整的 MTG 密钥
+    SECRET=$(build_mtg_secret "$RAW_SECRET" "$DOMAIN" "$TAG")
     
     echo ""
     cyan "========================================"
@@ -229,10 +306,11 @@ get_user_input() {
     cyan "========================================"
     blue "  端口: $PORT"
     blue "  伪装域名: $DOMAIN"
-    blue "  密钥: $SECRET"
+    blue "  原始密钥: $RAW_SECRET"
     if [[ -n $TAG ]]; then
-        blue "  频道: @$TAG"
+        blue "  频道标签: $TAG"
     fi
+    blue "  完整密钥: $SECRET"
     cyan "========================================"
     echo ""
 }
@@ -340,7 +418,7 @@ start_service() {
     systemctl start mtg
     
     # 等待服务启动
-    sleep 2
+    sleep 3
     
     if systemctl is-active --quiet mtg; then
         green "✓ 服务启动成功"
@@ -374,6 +452,16 @@ show_info() {
     "$BINEXEC" access "$CONFIG_FILE" 2>/dev/null || {
         yellow "无法自动获取链接，请手动运行: mtg access $CONFIG_FILE"
     }
+    echo ""
+    
+    # 显示配置信息
+    cyan "【配置信息】"
+    blue "  端口: $PORT"
+    blue "  伪装域名: $DOMAIN"
+    blue "  原始密钥: $RAW_SECRET"
+    if [[ -n $TAG ]]; then
+        blue "  频道标签: $TAG"
+    fi
     echo ""
     
     # 显示管理命令
@@ -428,8 +516,12 @@ upgrade_mode() {
     if systemctl is-active --quiet mtg; then
         green "\n✓ 升级成功！"
         cyan "\n当前版本: $("$BINEXEC" --version 2>&1 | head -n1)"
+        echo ""
+        cyan "【Telegram 代理链接】"
+        "$BINEXEC" access "$CONFIG_FILE" 2>/dev/null || true
     else
         red "\n✗ 服务启动失败，请检查日志"
+        red "查看日志: journalctl -u mtg -n 50"
         exit 1
     fi
 }
