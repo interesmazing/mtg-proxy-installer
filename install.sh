@@ -430,6 +430,81 @@ start_service() {
 }
 
 # ============================================
+# 获取服务器 IP
+# ============================================
+
+get_server_ip() {
+    local ipv4
+    local ipv6
+    
+    # 获取 IPv4
+    ipv4=$(wget -qO- -4 --timeout=5 https://api.ipify.org 2>/dev/null || \
+           wget -qO- -4 --timeout=5 http://ipv4.icanhazip.com 2>/dev/null || \
+           curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
+           echo "")
+    
+    # 获取 IPv6
+    ipv6=$(wget -qO- -6 --timeout=5 https://api6.ipify.org 2>/dev/null || \
+           wget -qO- -6 --timeout=5 http://ipv6.icanhazip.com 2>/dev/null || \
+           curl -s -6 --max-time 5 https://api6.ipify.org 2>/dev/null || \
+           echo "")
+    
+    echo "$ipv4|$ipv6"
+}
+
+# ============================================
+# 显示代理链接信息
+# ============================================
+
+show_proxy_links() {
+    local config_file=$1
+    
+    # 获取服务器 IP
+    local ips
+    ips=$(get_server_ip)
+    local ipv4=$(echo "$ips" | cut -d'|' -f1)
+    local ipv6=$(echo "$ips" | cut -d'|' -f2)
+    
+    # 从配置文件读取信息
+    local secret=$(grep "^secret" "$config_file" | cut -d'"' -f2)
+    local bind_to=$(grep "^bind-to" "$config_file" | cut -d'"' -f2)
+    local port=$(echo "$bind_to" | cut -d':' -f2)
+    
+    echo ""
+    cyan "【Telegram 代理链接】"
+    echo ""
+    
+    # IPv4 信息
+    if [[ -n $ipv4 ]]; then
+        blue "IPv4 代理信息："
+        echo "  IP: $ipv4"
+        echo "  Port: $port"
+        echo "  Secret (HEX): $secret"
+        echo "  TG URL: https://t.me/proxy?server=$ipv4&port=$port&secret=$secret"
+        echo ""
+    fi
+    
+    # IPv6 信息
+    if [[ -n $ipv6 ]]; then
+        blue "IPv6 代理信息："
+        echo "  IP: $ipv6"
+        echo "  Port: $port"
+        echo "  Secret (HEX): $secret"
+        echo "  TG URL: https://t.me/proxy?server=$ipv6&port=$port&secret=$secret"
+        echo ""
+    fi
+    
+    # 如果都获取失败
+    if [[ -z $ipv4 ]] && [[ -z $ipv6 ]]; then
+        yellow "无法自动获取服务器 IP，请手动构建链接："
+        echo "  Port: $port"
+        echo "  Secret (HEX): $secret"
+        echo "  TG URL: https://t.me/proxy?server=YOUR_IP&port=$port&secret=$secret"
+        echo ""
+    fi
+}
+
+# ============================================
 # 显示访问信息
 # ============================================
 
@@ -446,13 +521,8 @@ show_info() {
     systemctl status mtg --no-pager -l | head -n 10
     echo ""
     
-    # 显示访问链接
-    cyan "【Telegram 代理链接】"
-    echo ""
-    "$BINEXEC" access "$CONFIG_FILE" 2>/dev/null || {
-        yellow "无法自动获取链接，请手动运行: mtg access $CONFIG_FILE"
-    }
-    echo ""
+    # 显示代理链接
+    show_proxy_links "$CONFIG_FILE"
     
     # 显示配置信息
     cyan "【配置信息】"
@@ -511,14 +581,15 @@ upgrade_mode() {
     yellow "重启服务..."
     systemctl restart mtg
     
-    sleep 2
+    sleep 3
     
     if systemctl is-active --quiet mtg; then
         green "\n✓ 升级成功！"
         cyan "\n当前版本: $("$BINEXEC" --version 2>&1 | head -n1)"
         echo ""
-        cyan "【Telegram 代理链接】"
-        "$BINEXEC" access "$CONFIG_FILE" 2>/dev/null || true
+        
+        # 显示代理链接
+        show_proxy_links "$CONFIG_FILE"
     else
         red "\n✗ 服务启动失败，请检查日志"
         red "查看日志: journalctl -u mtg -n 50"
